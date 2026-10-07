@@ -1,0 +1,2 @@
+# container-image-scanner uses only the Python 3 standard library.
+# No third-party dependencies are required to run the scanner.
