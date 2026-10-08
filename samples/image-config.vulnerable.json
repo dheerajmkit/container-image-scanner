@@ -1,0 +1,29 @@
+{
+  "Architecture": "amd64",
+  "Config": {
+    "Cmd": [
+      "app.py"
+    ],
+    "Entrypoint": [
+      "python"
+    ],
+    "Env": [
+      "PATH=/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "APP_ENV=production",
+      "DB_PASSWORD=s3cr3t-p@ssw0rd",
+      "STRIPE_API_KEY=sk_test_REDACTED_DEMO_PLACEHOLDER"
+    ],
+    "ExposedPorts": {
+      "5432/tcp": {},
+      "8080/tcp": {}
+    },
+    "Healthcheck": null,
+    "User": "",
+    "WorkingDir": "/app"
+  },
+  "Id": "sha256:5f2d8a1b4c3e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b",
+  "Os": "linux",
+  "RepoTags": [
+    "payments-api:vulnerable-demo"
+  ]
+}

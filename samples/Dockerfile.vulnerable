@@ -1,0 +1,19 @@
+# Vulnerable sample — intentionally triggers every scanner rule.
+# Do NOT use as a template; see Dockerfile.clean for the fixed version.
+FROM python:latest
+
+ARG AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE
+
+ENV DB_PASSWORD=s3cr3t-p@ssw0rd \
+    APP_ENV=production
+
+RUN apt-get update && apt-get install -y curl git vim
+
+ADD app.tar.gz /app
+
+EXPOSE 8080 5432
+
+COPY . /app
+WORKDIR /app
+
+CMD ["python", "app.py"]

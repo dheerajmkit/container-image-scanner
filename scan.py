@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 """
-container-image-scanner (day 1)
+container-image-scanner (day 2)
 ================================
 A lightweight Dockerfile security linter written in pure Python 3
 (standard library only).
 
-It parses a Dockerfile and flags common container security anti-patterns:
+Day 2 adds:
+  * image-config scanning — lint `docker inspect`-style image config JSON
+    (Config.User / Config.Env / Config.ExposedPorts / Config.Healthcheck)
+    with DKS101-DKS104 rules,
+  * SARIF 2.1.0 output for CI ingestion (--format sarif),
+  * sample Dockerfiles and image configs under samples/.
+
+Dockerfile rules (day 1):
 
   DKS001  running as root (no USER, or USER root)            HIGH
   DKS002  base image uses :latest (or untagged)              MEDIUM
@@ -15,9 +22,12 @@ It parses a Dockerfile and flags common container security anti-patterns:
   DKS006  missing HEALTHCHECK                                LOW
   DKS007  bloated package install (no cleanup flags)         LOW
 
-Findings are severity-graded, carry rule IDs plus remediation hints,
-and roll up into an A-F image grade. Reports print as human-readable
-text or JSON.
+Image-config rules (day 2):
+
+  DKS101  image runs as root (Config.User empty/root)        HIGH
+  DKS102  secret in image env (Config.Env)                   CRITICAL
+  DKS103  image has no healthcheck                           LOW
+  DKS104  sensitive port in Config.ExposedPorts               MEDIUM
 
 This is a personal portfolio project exploring shift-left container
 security. It is a learning exercise, not a production tool, and it has
@@ -29,9 +39,9 @@ import json
 import re
 import shlex
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
 SEVERITY_RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
@@ -133,9 +143,6 @@ def parse_dockerfile(text):
         if not code or code.startswith("#"):
             continue
         keyword, _, args = code.partition(" ")
-        # A "#" that is not at the start of the line is part of the
-        # instruction (e.g. a trailing comment); keep the raw text so
-        # inline suppression comments can be honoured later.
         instructions.append(
             Instruction(
                 keyword=keyword.upper(),
@@ -239,6 +246,8 @@ def rule_latest_tag(instructions):
         ref = ins.args.split()[0] if ins.args else ""
         if not ref or ref.lower() == "scratch":
             continue
+        if "@" in ref:
+            continue  # digest-pinned: immutable regardless of tag
         name = ref.split("@")[0]  # drop any digest pin
         slash = name.rfind("/")
         colon = name.rfind(":")
@@ -446,14 +455,105 @@ DOCKERFILE_RULES = [
 ]
 
 
-def scan_dockerfile(text):
-    """Run every Dockerfile rule; returns (instructions, findings)."""
-    instructions = parse_dockerfile(text)
-    findings = []
-    for rule in DOCKERFILE_RULES:
-        findings.extend(rule(instructions))
-    return instructions, apply_suppressions(instructions, findings)
+# ---------------------------------------------------------------------------
+# Image-config (docker inspect) scanning
+# ---------------------------------------------------------------------------
 
+def load_image_config(path):
+    """Load a `docker inspect`-style image config file.
+
+    Accepts either the full inspect array ([{... "Config": {...}}]) or a
+    bare config object ({"User": ..., "Env": [...], ...}).
+    """
+    with open(path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if isinstance(data, list):
+        if not data:
+            raise ValueError("image config list is empty")
+        data = data[0]
+    if isinstance(data, dict) and "Config" in data and isinstance(data["Config"], dict):
+        return data["Config"]
+    if isinstance(data, dict):
+        return data
+    raise ValueError("unrecognised image config shape")
+
+
+def scan_image_config(config):
+    """Run the DKS1xx rules over an image config dict."""
+    findings = []
+    user = str(config.get("User") or "").strip()
+    if user in ("", "root", "0"):
+        findings.append(
+            Finding(
+                rule_id="DKS101",
+                severity="HIGH",
+                title="Image runs as root",
+                detail="Config.User is empty or root; containers start as uid 0.",
+                line=None,
+                remediation=(
+                    "Set a non-root USER in the Dockerfile so Config.User is "
+                    "populated at build time."
+                ),
+                source="image-config",
+            )
+        )
+    for entry in config.get("Env") or []:
+        name, _, _value = entry.partition("=")
+        if SECRET_NAME_RE.search(name):
+            findings.append(
+                Finding(
+                    rule_id="DKS102",
+                    severity="CRITICAL",
+                    title="Secret in image environment",
+                    detail=(
+                        f"Config.Env '{name}' looks like a credential baked "
+                        "into the image."
+                    ),
+                    line=None,
+                    remediation=(
+                        "Inject secrets at runtime (orchestrator secrets, "
+                        "vault agent) instead of baking them into the image."
+                    ),
+                    source="image-config",
+                )
+            )
+    exposed = config.get("ExposedPorts") or {}
+    for key in exposed:
+        port_part = str(key).split("/")[0]
+        if port_part.isdigit() and int(port_part) in SENSITIVE_PORTS:
+            findings.append(
+                Finding(
+                    rule_id="DKS104",
+                    severity="MEDIUM",
+                    title="Sensitive port exposed",
+                    detail=(
+                        f"ExposedPorts includes {port_part} "
+                        f"({SENSITIVE_PORTS[int(port_part)]})."
+                    ),
+                    line=None,
+                    remediation="Do not publish database/admin ports from the image.",
+                    source="image-config",
+                )
+            )
+    healthcheck = config.get("Healthcheck")
+    if not healthcheck or not healthcheck.get("Test"):
+        findings.append(
+            Finding(
+                rule_id="DKS103",
+                severity="LOW",
+                title="Image has no healthcheck",
+                detail="Config.Healthcheck is missing; orchestrators cannot probe liveness.",
+                line=None,
+                remediation="Add a HEALTHCHECK instruction to the Dockerfile.",
+                source="image-config",
+            )
+        )
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Suppressions
+# ---------------------------------------------------------------------------
 
 def apply_suppressions(instructions, findings):
     """Drop findings suppressed by inline `# containerscan:ignore=` comments."""
@@ -468,6 +568,15 @@ def apply_suppressions(instructions, findings):
             continue
         kept.append(finding)
     return kept
+
+
+def scan_dockerfile(text):
+    """Run every Dockerfile rule; returns (instructions, findings)."""
+    instructions = parse_dockerfile(text)
+    findings = []
+    for rule in DOCKERFILE_RULES:
+        findings.extend(rule(instructions))
+    return instructions, apply_suppressions(instructions, findings)
 
 
 # ---------------------------------------------------------------------------
@@ -517,7 +626,7 @@ def format_text(findings, target):
     if not findings:
         lines.append("No findings. Image looks clean.")
     for finding in sort_findings(findings):
-        where = f"line {finding.line}" if finding.line is not None else "Dockerfile"
+        where = f"line {finding.line}" if finding.line is not None else finding.source
         lines.append(f"[{finding.rule_id}] {finding.severity:<8} {where}")
         lines.append(f"  {finding.title}: {finding.detail}")
         lines.append(f"  -> {finding.remediation}")
@@ -542,13 +651,88 @@ def format_json(findings, target):
     return json.dumps(payload, indent=2)
 
 
+SARIF_LEVEL = {"CRITICAL": "error", "HIGH": "error", "MEDIUM": "warning", "LOW": "note"}
+
+RULE_HELP = {
+    "DKS001": "Run containers as a non-root user.",
+    "DKS002": "Pin base images to an immutable tag or digest.",
+    "DKS003": "Never bake secrets into image layers.",
+    "DKS004": "Prefer COPY over ADD.",
+    "DKS005": "Do not expose database/admin ports.",
+    "DKS006": "Define a HEALTHCHECK.",
+    "DKS007": "Use package-manager cleanup flags to keep layers small.",
+    "DKS101": "Set a non-root Config.User.",
+    "DKS102": "Never bake secrets into image environment.",
+    "DKS103": "Define a healthcheck for the image.",
+    "DKS104": "Do not expose database/admin ports.",
+}
+
+
+def format_sarif(findings, target):
+    """Render findings as SARIF 2.1.0 (for GitHub code scanning etc.)."""
+    rules = []
+    seen = set()
+    for finding in sort_findings(findings):
+        if finding.rule_id not in seen:
+            seen.add(finding.rule_id)
+            rules.append(
+                {
+                    "id": finding.rule_id,
+                    "name": finding.title,
+                    "shortDescription": {"text": finding.title},
+                    "fullDescription": {"text": finding.remediation},
+                    "help": {"text": RULE_HELP.get(finding.rule_id, finding.remediation)},
+                    "properties": {"severity": finding.severity},
+                }
+            )
+    results = []
+    for finding in sort_findings(findings):
+        region = {}
+        if finding.line is not None:
+            region = {"startLine": finding.line}
+        results.append(
+            {
+                "ruleId": finding.rule_id,
+                "level": SARIF_LEVEL.get(finding.severity, "warning"),
+                "message": {"text": f"{finding.title}: {finding.detail}"},
+                "locations": [
+                    {
+                        "physicalLocation": {
+                            "artifactLocation": {"uri": target},
+                            "region": region,
+                        }
+                    }
+                ],
+            }
+        )
+    sarif = {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "container-image-scanner",
+                        "version": VERSION,
+                        "informationUri": "https://github.com/dheerajmkit/container-image-scanner",
+                        "rules": rules,
+                    }
+                },
+                "results": results,
+            }
+        ],
+    }
+    return json.dumps(sarif, indent=2)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Lint a Dockerfile for container security anti-patterns."
+        description="Lint a Dockerfile and/or image config for container "
+        "security anti-patterns."
     )
     parser.add_argument(
         "dockerfile",
@@ -557,8 +741,14 @@ def build_parser():
         help="Path to the Dockerfile to scan (default: ./Dockerfile).",
     )
     parser.add_argument(
+        "--image-config",
+        metavar="PATH",
+        default=None,
+        help="Also scan a `docker inspect`-style image config JSON file.",
+    )
+    parser.add_argument(
         "--format",
-        choices=("text", "json"),
+        choices=("text", "json", "sarif"),
         default="text",
         help="Report format (default: text).",
     )
@@ -587,11 +777,24 @@ def main(argv=None):
         return 2
 
     _instructions, findings = scan_dockerfile(text)
+    target = args.dockerfile
+
+    if args.image_config:
+        try:
+            config = load_image_config(args.image_config)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"error: cannot parse image config '{args.image_config}': {exc}",
+                  file=sys.stderr)
+            return 2
+        findings.extend(scan_image_config(config))
+        target = f"{args.dockerfile} + {args.image_config}"
 
     if args.format == "json":
-        print(format_json(findings, args.dockerfile))
+        print(format_json(findings, target))
+    elif args.format == "sarif":
+        print(format_sarif(findings, target))
     else:
-        print(format_text(findings, args.dockerfile))
+        print(format_text(findings, target))
 
     if args.fail_on == "never":
         return 0

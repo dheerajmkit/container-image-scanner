@@ -1,0 +1,34 @@
+{
+  "Architecture": "amd64",
+  "Config": {
+    "Cmd": [
+      "app.py"
+    ],
+    "Entrypoint": [
+      "python"
+    ],
+    "Env": [
+      "PATH=/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "APP_ENV=production",
+      "LOG_LEVEL=info"
+    ],
+    "ExposedPorts": {
+      "8080/tcp": {}
+    },
+    "Healthcheck": {
+      "Interval": 30000000000,
+      "Test": [
+        "CMD-SHELL",
+        "curl -f http://localhost:8080/health || exit 1"
+      ],
+      "Timeout": 5000000000
+    },
+    "User": "appuser",
+    "WorkingDir": "/app"
+  },
+  "Id": "sha256:1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c",
+  "Os": "linux",
+  "RepoTags": [
+    "payments-api:hardened-demo"
+  ]
+}

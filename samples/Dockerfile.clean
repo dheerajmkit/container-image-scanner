@@ -1,0 +1,21 @@
+# Clean sample — follows the container security practices the scanner checks.
+# (Digest below is illustrative — pin the real digest of the tag you use.)
+FROM python:3.12-slim-bookworm@sha256:9ca8c5d5b1e4b7d1b6c6b7c8a9f0e1d2c3b4a59687766554433221100ffeeddccbbaa AS base
+
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --chown=appuser:appuser . /app
+WORKDIR /app
+
+USER appuser
+
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s CMD curl -f http://localhost:8080/health || exit 1
+
+ENTRYPOINT ["python"]
+CMD ["app.py"]
