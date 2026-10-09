@@ -1,0 +1,7 @@
+{
+  "fail_on": "high",
+  "ignore_rules": [
+    "DKS006",
+    "DKS007"
+  ]
+}

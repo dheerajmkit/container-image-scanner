@@ -307,3 +307,64 @@ def test_cli_exit_codes(tmp_path, capsys):
     assert scan.main([str(dockerfile), "--fail-on", "low"]) == 1
     capsys.readouterr()
     assert scan.main([str(tmp_path / "missing")]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Day 3 — suppression config file
+# ---------------------------------------------------------------------------
+
+def test_load_scan_config(tmp_path):
+    path = tmp_path / "scan.json"
+    path.write_text(json.dumps({"ignore_rules": ["dks004", "DKS007"], "fail_on": "medium"}))
+    config = scan.load_scan_config(str(path))
+    assert config["ignore_rules"] == {"DKS004", "DKS007"}
+    assert config["fail_on"] == "medium"
+
+
+def test_load_scan_config_rejects_bad_fail_on(tmp_path):
+    path = tmp_path / "scan.json"
+    path.write_text(json.dumps({"fail_on": "extreme"}))
+    with pytest.raises(ValueError):
+        scan.load_scan_config(str(path))
+
+
+def test_config_suppression_drops_rules():
+    findings = findings_for("FROM ubuntu:latest\nADD a.tar.gz /app\n")
+    assert "DKS004" in rule_ids(findings)
+    kept = scan.apply_config_suppressions(findings, {"DKS004"})
+    assert "DKS004" not in rule_ids(kept)
+    assert "DKS002" in rule_ids(kept)
+
+
+def test_cli_config_file(tmp_path, capsys):
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM ubuntu:latest\nUSER appuser\n")
+    config = tmp_path / "scan.json"
+    config.write_text(json.dumps({"ignore_rules": ["DKS002"]}))
+    # DKS002 suppressed -> only DKS006 (LOW) remains -> gate passes on high.
+    assert scan.main([str(dockerfile), "--config", str(config)]) == 0
+    capsys.readouterr()
+    # Bad config path is a usage error.
+    assert scan.main([str(dockerfile), "--config", str(tmp_path / "nope.json")]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Day 3 — Markdown report
+# ---------------------------------------------------------------------------
+
+def test_markdown_output_shape():
+    findings = findings_for("FROM ubuntu:latest\n")
+    report = scan.format_markdown(findings, "Dockerfile")
+    assert report.startswith("# Container Image Scan Report")
+    assert "**Grade:**" in report
+    assert "| DKS002 | MEDIUM |" in report
+    assert "## Summary" in report and "## Findings" in report
+
+
+def test_markdown_clean_report():
+    findings = findings_for(
+        "FROM ubuntu:22.04\nUSER appuser\nHEALTHCHECK CMD true\n"
+    )
+    report = scan.format_markdown(findings, "Dockerfile")
+    assert "No findings. Image looks clean." in report
+    assert "**Grade:** A (100/100)" in report

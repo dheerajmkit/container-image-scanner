@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-container-image-scanner (day 2)
+container-image-scanner (day 3)
 ================================
 A lightweight Dockerfile security linter written in pure Python 3
 (standard library only).
 
-Day 2 adds:
-  * image-config scanning — lint `docker inspect`-style image config JSON
-    (Config.User / Config.Env / Config.ExposedPorts / Config.Healthcheck)
-    with DKS101-DKS104 rules,
-  * SARIF 2.1.0 output for CI ingestion (--format sarif),
-  * sample Dockerfiles and image configs under samples/.
+Day 3 adds:
+  * suppression config file (--config scan.json) with `ignore_rules`
+    and a `fail_on` default,
+  * Markdown report with the A-F image grade (--format markdown),
+  * sample GitHub Actions CI workflow (.github/workflows/ci.yml),
+  * full usage documentation (USAGE.md).
 
-Dockerfile rules (day 1):
+Day 2 added image-config scanning (DKS101-DKS104) and SARIF output.
+Day 1 added the Dockerfile parser and DKS001-DKS007 rules.
+
+Dockerfile rules:
 
   DKS001  running as root (no USER, or USER root)            HIGH
   DKS002  base image uses :latest (or untagged)              MEDIUM
@@ -22,7 +25,7 @@ Dockerfile rules (day 1):
   DKS006  missing HEALTHCHECK                                LOW
   DKS007  bloated package install (no cleanup flags)         LOW
 
-Image-config rules (day 2):
+Image-config rules:
 
   DKS101  image runs as root (Config.User empty/root)        HIGH
   DKS102  secret in image env (Config.Env)                   CRITICAL
@@ -41,7 +44,7 @@ import shlex
 import sys
 from dataclasses import dataclass
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
 SEVERITY_RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
@@ -556,7 +559,7 @@ def scan_image_config(config):
 # ---------------------------------------------------------------------------
 
 def apply_suppressions(instructions, findings):
-    """Drop findings suppressed by inline `# containerscan:ignore=` comments."""
+    """Drop findings suppressed by inline `# containerscan:ignore` comments."""
     ignored = {}  # line -> set(rule_id)
     for ins in instructions:
         rules = inline_ignored_rules(ins.raw)
@@ -568,6 +571,40 @@ def apply_suppressions(instructions, findings):
             continue
         kept.append(finding)
     return kept
+
+
+def load_scan_config(path):
+    """Load a JSON suppression config file.
+
+    Supported keys:
+      ignore_rules: list of rule IDs to suppress everywhere,
+      fail_on:      default severity gate (critical/high/medium/low/never).
+    """
+    with open(path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError("config file must contain a JSON object")
+    ignore_rules = data.get("ignore_rules", []) or []
+    if not isinstance(ignore_rules, list) or not all(
+        isinstance(r, str) for r in ignore_rules
+    ):
+        raise ValueError("'ignore_rules' must be a list of rule ID strings")
+    fail_on = data.get("fail_on")
+    if fail_on is not None and str(fail_on).lower() not in (
+        "critical", "high", "medium", "low", "never",
+    ):
+        raise ValueError("'fail_on' must be critical/high/medium/low/never")
+    return {
+        "ignore_rules": {r.upper() for r in ignore_rules},
+        "fail_on": str(fail_on).lower() if fail_on else None,
+    }
+
+
+def apply_config_suppressions(findings, ignore_rules):
+    """Drop every finding whose rule ID is listed in the config file."""
+    if not ignore_rules:
+        return findings
+    return [f for f in findings if f.rule_id.upper() not in ignore_rules]
 
 
 def scan_dockerfile(text):
@@ -725,6 +762,60 @@ def format_sarif(findings, target):
     return json.dumps(sarif, indent=2)
 
 
+def format_markdown(findings, target):
+    """Render a Markdown report with the A-F image grade."""
+    from datetime import datetime, timezone
+
+    grade, score = grade_findings(findings)
+    counts = summarize(findings)
+    stamped = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [
+        "# Container Image Scan Report",
+        "",
+        f"**Target:** `{target}`",
+        f"**Scanned:** {stamped}",
+        f"**Grade:** {grade} ({score}/100)",
+        "",
+        "## Summary",
+        "",
+        "| Severity | Count |",
+        "| -------- | ----- |",
+    ]
+    for severity in SEVERITIES:
+        lines.append(f"| {severity} | {counts[severity]} |")
+    lines += ["", "## Findings", ""]
+    if not findings:
+        lines.append("No findings. Image looks clean.")
+    else:
+        lines += [
+            "| Rule | Severity | Location | Finding | Remediation |",
+            "| ---- | -------- | -------- | ------- | ----------- |",
+        ]
+        for finding in sort_findings(findings):
+            where = (
+                f"line {finding.line}"
+                if finding.line is not None
+                else finding.source
+            )
+            # Keep table cells on one line.
+            detail = " ".join(finding.detail.split())
+            remediation = " ".join(finding.remediation.split())
+            lines.append(
+                f"| {finding.rule_id} | {finding.severity} | {where} | "
+                f"**{finding.title}** — {detail} | {remediation} |"
+            )
+    lines += [
+        "",
+        "## Grade scale",
+        "",
+        "Score starts at 100. Penalties: critical −25, high −15, medium −5, "
+        "low −2. A ≥ 90, B ≥ 80, C ≥ 70, D ≥ 60, F < 60.",
+        "",
+        f"*Generated by container-image-scanner v{VERSION}*",
+    ]
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -747,8 +838,14 @@ def build_parser():
         help="Also scan a `docker inspect`-style image config JSON file.",
     )
     parser.add_argument(
+        "--config",
+        metavar="PATH",
+        default=None,
+        help="JSON suppression config file with 'ignore_rules' and 'fail_on'.",
+    )
+    parser.add_argument(
         "--format",
-        choices=("text", "json", "sarif"),
+        choices=("text", "json", "sarif", "markdown"),
         default="text",
         help="Report format (default: text).",
     )
@@ -789,16 +886,30 @@ def main(argv=None):
         findings.extend(scan_image_config(config))
         target = f"{args.dockerfile} + {args.image_config}"
 
+    fail_on = args.fail_on
+    if args.config:
+        try:
+            scan_config = load_scan_config(args.config)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"error: cannot parse config '{args.config}': {exc}",
+                  file=sys.stderr)
+            return 2
+        findings = apply_config_suppressions(findings, scan_config["ignore_rules"])
+        if scan_config["fail_on"]:
+            fail_on = scan_config["fail_on"]
+
     if args.format == "json":
         print(format_json(findings, target))
     elif args.format == "sarif":
         print(format_sarif(findings, target))
+    elif args.format == "markdown":
+        print(format_markdown(findings, target))
     else:
         print(format_text(findings, target))
 
-    if args.fail_on == "never":
+    if fail_on == "never":
         return 0
-    threshold = SEVERITY_RANK[args.fail_on.upper()]
+    threshold = SEVERITY_RANK[fail_on.upper()]
     worst = max((SEVERITY_RANK[f.severity] for f in findings), default=0)
     return 1 if worst >= threshold else 0
 
